@@ -61,7 +61,7 @@ ORDER BY last_seen DESC;
 
 For one shared table, `GET /api/2.0/lineage-tracking/table-lineage?table_name=<catalog.schema.table>&include_entity_lineage=true` gives immediate upstream and downstream tables plus `pipelineInfos` with pipeline and update IDs. Use `system.access.table_lineage` when you need a time-bounded history or many edges. For `entity_type = 'PIPELINE'`, `entity_id` is the pipeline ID and `entity_run_id` is the update ID. Lineage `event_time` records observed access; it is not a table commit or data-arrival time.
 
-The queries below were tested with literal parameters in an Azure Databricks workspace. Bind UTC time bounds and the corresponding UTC date partitions. Confirm current table paths and permissions in the target workspace.
+The identifier, stage, and offset queries below were tested with literal parameters in an Azure Databricks workspace. The arrival-versus-advance calculation was also backtested on one append-only Delta handoff with a single, stable source. Bind UTC time bounds and the corresponding UTC date partitions. Confirm current table paths and permissions in the target workspace.
 
 ## Find pipelines around one table
 
@@ -92,7 +92,7 @@ ORDER BY relationship, pipeline_id;
 
 ## Compare the two flows in one window
 
-Choose the flow actually writing the shared table and the flow reading it. The downstream flow's `backlog_bytes` describes its own source, not the producer's backlog. For a flow with several sources, inspect `details:flow_progress.metrics.source_metrics` before attributing the total to this edge. For a Delta source, match its path or `sources[*].endOffset.reservoirId` to `DESCRIBE DETAIL <shared_table>`; do not infer the source from the flow name alone. Do not add byte backlogs across stages.
+Choose the flow actually writing the shared table and the flow reading it. The downstream flow's `backlog_bytes` describes its own source, not the producer's backlog. For a flow with several sources, inspect the `details:flow_progress.metrics.source_metrics` array and match its `source_name` before attributing backlog to this edge. For a Delta source, match its path or `sources[*].endOffset.reservoirId` to `DESCRIBE DETAIL <shared_table>`; do not infer the source from the flow name alone. Do not add byte backlogs across stages.
 
 ```sql
 WITH scoped AS (
@@ -163,11 +163,29 @@ For the sampled Delta source, `sourceVersion = 1` and `index = -1` mark the posi
 
 Use `DESCRIBE HISTORY <shared_table> LIMIT <n>` for source commit times and `DESCRIBE HISTORY <consumer_output_table> LIMIT <n>` for output commit times. Check that an output `STREAMING UPDATE` has `operationParameters.epochId = batch_id`. For each data-writing source commit in the version interval, subtract its commit time from that batch's output commit time. Exclude maintenance commits and batches with no output. This measures **table commit to output commit**, not source-event creation to final availability. Weighting each source commit equally does not yield a per-record latency distribution.
 
+### Compare source arrivals with consumer advance
+
+For an append-only shared Delta table, reuse the verified consumer version ranges above and `DESCRIBE HISTORY <shared_table>`. In each complete, equal-length window, calculate:
+
+| Measure | Calculation using the shared table's data-writing commits |
+| --- | --- |
+| Arrival bytes | Sum `operationMetrics.numOutputBytes` for commits made during the window. |
+| Advanced bytes | Sum the **same commits'** `numOutputBytes` for versions consumed by batches completed during the window. Count each version once. |
+| Observed rates | Divide each sum by the window's elapsed seconds; also report `arrival_rate - advance_rate` and `advance_bytes / arrival_bytes` when arrivals are nonzero. |
+
+This compares bytes in the same compressed Delta files. Arrival rate above advance rate suggests accumulation; advance rate above arrival rate suggests recovery. Similar rates can sustain a nonzero backlog. Show the first and last source-specific backlog readings beside the rates, and investigate if their direction disagrees. The rate difference need not numerically equal the backlog change: backlog readings are snapshots inside the window, while history records file writes. Confirm that history covers every commit in the arrival window and every consumed version, and that each data-writing commit has `numOutputBytes`; otherwise report the affected rate as unknown. Exclude `OPTIMIZE`, metadata-only and zero-byte commits. Rewrites, deletes, partial offsets, or a changed source set need a different accounting method; do not call these figures bytes actually read or maximum processing capacity.
+
+### Compare bytes written across the handoff
+
+For the same matched batches, check `operationMetrics.numOutputBytes` and `numOutputRows` in both `DESCRIBE HISTORY` results. For each consumer batch, sum the producer's data-writing commit bytes for the source versions it consumed, then divide that batch's output-commit bytes by the sum. Across several batches, use **sum of output bytes / sum of matched input-table bytes**, rather than averaging batch ratios. Also report the row-count ratio and bytes per output row when the metrics are present; these help distinguish filtering from wider output rows. Omit batches with zero input bytes or missing metrics, and report how many batches qualified.
+
+Call this a **Delta write-byte ratio**: the producer bytes are compressed files written to the shared table, not bytes the consumer actually read. Exclude `OPTIMIZE` and other maintenance writes. Rewrites, file layout, compression, joins, and multiple inputs can change the ratio; do not attribute all output bytes to one source when the flow reads several tables. This ratio describes the matched handoff's storage footprint, not record-level latency.
+
 ## Choose the delay you mean
 
 | Question | Evidence and limit |
 | --- | --- |
-| Which stage is falling behind? | Compare each flow's backlog trend and batch-duration distribution over the same window. Backlog units and sources can differ. |
+| Which stage is falling behind? | Compare each flow's backlog trend with its own healthy band, and compare batch-duration distributions over the same window. A nonzero end-of-batch backlog can be normal. Backlog units and sources can differ. |
 | When was the shared table published? | `DESCRIBE HISTORY <shared_table>` gives Delta commit versions and timestamps. Filter to data-writing operations; maintenance such as `OPTIMIZE` also creates versions. A recent commit alone does not prove the consumer has read it. |
 | Has the consumer reached a producer version? | Use the Delta handoff method above when the source ID and offset boundary are verified. A version gap alone is not elapsed time. |
 | How old is the newest event in the final table? | If an original event timestamp survives every stage, query its maximum at each table and calculate `current_timestamp() - max(event_timestamp)` with an appropriate data window. Validate timestamp meaning and clock skew. This is a freshness indicator, not the distribution of record delays. |

@@ -1,6 +1,6 @@
 # Event-log patterns beyond the official examples
 
-Use the [current table reference](https://docs.databricks.com/aws/en/admin/system-tables/pipeline-events) to confirm the path. Bind the scope parameters in Databricks SQL. These examples were tested with representative inputs in an Azure Databricks workspace; inspect payloads and metric meaning in the target pipeline before using them in an alert.
+Use the [current table reference](https://docs.databricks.com/aws/en/admin/system-tables/pipeline-events) to confirm the path. Bind the scope parameters in Databricks SQL. The windowed backlog query was live tested on a single-source Delta flow in an Azure Databricks workspace. Inspect payloads and metric meaning in the target pipeline before using them in an alert.
 
 ## Time since the last completed batch
 
@@ -40,42 +40,60 @@ FROM flows CROSS JOIN bounds LEFT JOIN latest_state ON true
 ORDER BY flows.flow_name;
 ```
 
-## Backlog drain and catch-up
+## Backlog trend and return to baseline
 
-Choose a recent window long enough to smooth bursts. This is **net** backlog change, not input throughput. Compare only like-for-like sources and flows; a missing backlog, reset, growing backlog, or nonpositive drain yields no catch-up estimate. Re-run after restarts rather than carrying a forecast across an update boundary.
+`flow_progress` backlog is a snapshot after processing, so a busy continuous source can have a nonzero reading after every batch. Bind a positive `:window_seconds` long enough to include several readings and a normal burst cycle. Set `:start_time` and `:end_time` on window boundaries, then use three consecutive, complete windows from the same update and source set. This measures **net** backlog change, not input throughput. The SQL below uses the flow's total backlog; when it has multiple sources, inspect the `metrics.source_metrics` array and select the matching `source_name` before assigning a trend to one table.
 
 ```sql
 WITH samples AS (
   SELECT workspace_id, pipeline_id, update_id, origin.flow_id AS flow_id,
          origin.flow_name AS flow_name,
          event_time,
+         CAST(floor(unix_timestamp(event_time) / :window_seconds) AS BIGINT) AS window_id,
          variant_get(details, '$.flow_progress.metrics.backlog_bytes', 'DOUBLE') AS backlog_bytes
   FROM system.lakeflow_pipeline_events_preview.pipeline_events
   WHERE workspace_id = :workspace_id AND pipeline_id = :pipeline_id
+    AND update_id = :update_id AND origin.flow_name = :flow_name
     AND event_type = 'flow_progress'
     AND event_time >= :start_time AND event_time < :end_time
 ), windowed AS (
-  SELECT workspace_id, pipeline_id, update_id, flow_id, flow_name,
+  SELECT workspace_id, pipeline_id, update_id, flow_id, flow_name, window_id,
          count(*) AS samples, min(event_time) AS first_at, max(event_time) AS last_at,
          min_by(backlog_bytes, event_time) AS first_backlog_bytes,
-         max_by(backlog_bytes, event_time) AS last_backlog_bytes
+         max_by(backlog_bytes, event_time) AS last_backlog_bytes,
+         percentile_approx(backlog_bytes, 0.5) AS median_backlog_bytes,
+         min(backlog_bytes) AS min_backlog_bytes,
+         max(backlog_bytes) AS max_backlog_bytes
   FROM samples
-  WHERE flow_name = :flow_name AND backlog_bytes IS NOT NULL
-  GROUP BY workspace_id, pipeline_id, update_id, flow_id, flow_name
+  WHERE backlog_bytes IS NOT NULL
+  GROUP BY workspace_id, pipeline_id, update_id, flow_id, flow_name, window_id
 ), rates AS (
   SELECT *, timestampdiff(SECOND, first_at, last_at) AS elapsed_seconds,
-         first_backlog_bytes - last_backlog_bytes AS bytes_cleared
+         last_backlog_bytes - first_backlog_bytes AS net_change_bytes
   FROM windowed
 )
-SELECT workspace_id, pipeline_id, update_id, flow_id, flow_name, samples,
+SELECT workspace_id, pipeline_id, update_id, flow_id, flow_name, window_id, samples,
        first_at, last_at, first_backlog_bytes, last_backlog_bytes,
+       median_backlog_bytes, min_backlog_bytes, max_backlog_bytes,
        CASE WHEN samples >= 2 AND elapsed_seconds > 0
-            THEN bytes_cleared / elapsed_seconds END AS net_drain_bytes_per_second,
-       CASE WHEN samples >= 2 AND elapsed_seconds > 0 AND bytes_cleared > 0
-            THEN last_backlog_bytes * elapsed_seconds / bytes_cleared
-       END AS estimated_seconds_to_zero
-FROM rates;
+            THEN net_change_bytes / elapsed_seconds
+       END AS net_backlog_change_bytes_per_second
+FROM rates
+ORDER BY window_id;
 ```
+
+Build a baseline from comparable load and time-of-day windows when the flow met its freshness target. Let `U` be the p95 of their window medians, and `E` the p95 of their absolute changes between truly consecutive healthy windows in the same update. As a default, require at least 20 such baseline windows. For the last three complete, consecutive windows, let `M0`, `M1`, and `M2` be their median backlogs. Require at least five readings per window and use the same source set throughout; increase the window length if the flow has fewer readings.
+
+| Rule | Classification |
+| --- | --- |
+| `M2 > U` and both `M1 - M0 > E` and `M2 - M1 > E` | Accumulating |
+| `M2 > U` and both `M1 - M0 < -E` and `M2 - M1 < -E` | Recovering |
+| `M2 > U` and neither sustained direction holds | Elevated or variable; check data age |
+| `M2 <= U` | Within the healthy band; mention a rising trend if both increases exceed `E` |
+
+If individual readings spike but window medians return to the band, describe them as bursty. Without representative healthy windows, report only the observed direction, not a health label. Report **unknown** for sparse or nonconsecutive windows, resets, a changed source set, or missing readings. For an append-only Delta source, compare source arrival and consumer advance rates over these same windows using [cross-pipeline handoff history](cross-pipeline.md#compare-source-arrivals-with-consumer-advance). Sustained disagreement between those rates and the backlog trend calls for investigating metric semantics or incomplete history, not forcing a label. Zero is a target only when the source is expected to go idle.
+
+If backlog is recovering, estimate time to the healthy baseline as `(M2 - baseline_bytes) / sustained_net_drain_bytes_per_second`, with the positive drain rate estimated from the decline of window medians over elapsed time. Report it as conditional, and only when adjacent windows show a similar drain rate. Recompute after restarts or load changes. Backlog bytes alone cannot give record age: for a Delta source, use its offsets and source commit timestamps to check the age of unconsumed versions; use event timestamps carried with records for true data freshness.
 
 ## Classic autoscaling evidence
 
