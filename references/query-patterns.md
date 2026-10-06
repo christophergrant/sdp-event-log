@@ -4,12 +4,15 @@ Use the [current table reference](https://docs.databricks.com/aws/en/admin/syste
 
 ## Time since the last completed batch
 
-Use the [previous-updates example](https://docs.databricks.com/aws/en/ldp/monitor-event-logs#monitor-pipeline-updates-by-querying-previous-updates) to identify `:update_id`. Include its start in the time window. This returns flows with a `flow_definition` or `stream_progress` event in that window. A `NULL` last batch means none was observed in the window, not that the pipeline is stuck. Check event delivery, expected cadence, and whether input or backlog exists before alerting.
+Use the [previous-updates example](https://docs.databricks.com/aws/en/ldp/monitor-event-logs#monitor-pipeline-updates-by-querying-previous-updates) to identify `:update_id`. Include its start in the time window. This returns flows with a `flow_definition` or `stream_progress` event in that window. A `NULL` last batch means none was observed in the window, not that the pipeline is stuck. Check event delivery, expected cadence, and whether input or backlog exists before alerting. Use the system table for this check: a Pipeline Events API listing may omit recent progress rows that the system table contains.
+
+Compare the last completed batch with the last explicit backlog snapshot. A zero `backlog_bytes` means no reported backlog **at that snapshot**, even if the batch wrote rows. A missing or old backlog reading means current backlog is unknown. Spark's [`sink.numOutputRows = -1`](https://spark.apache.org/docs/latest/api/java/org/apache/spark/sql/streaming/SinkProgress.html) means the sink did not report an output row count; it says nothing about backlog. When a flow has multiple sources, use the matching entry in `flow_progress.metrics.source_metrics`.
 
 ```sql
 WITH scoped AS (
   SELECT event_time, pipeline_event_id, event_type, origin.flow_name,
-         variant_get(details, '$.update_progress.state', 'STRING') AS update_state
+         variant_get(details, '$.update_progress.state', 'STRING') AS update_state,
+         variant_get(details, '$.flow_progress.metrics.backlog_bytes', 'BIGINT') AS backlog_bytes
   FROM system.lakeflow_pipeline_events_preview.pipeline_events
   WHERE workspace_id = :workspace_id AND pipeline_id = :pipeline_id
     AND update_id = :update_id
@@ -27,9 +30,18 @@ WITH scoped AS (
   WHERE flow_name IS NOT NULL
     AND event_type IN ('flow_definition', 'stream_progress')
   GROUP BY flow_name
+), backlog AS (
+  SELECT flow_name,
+         max(event_time) AS last_backlog_at,
+         max_by(backlog_bytes, event_time) AS last_backlog_bytes
+  FROM scoped
+  WHERE event_type = 'flow_progress' AND backlog_bytes IS NOT NULL
+    AND flow_name IS NOT NULL
+  GROUP BY flow_name
 )
 SELECT flows.flow_name, latest_state.update_state, bounds.update_started_at,
-       flows.last_completed_batch_at,
+       flows.last_completed_batch_at, backlog.last_backlog_at,
+       backlog.last_backlog_bytes,
        CASE WHEN latest_state.update_state = 'RUNNING'
              AND bounds.update_started_at IS NOT NULL
             THEN timestampdiff(SECOND,
@@ -37,6 +49,7 @@ SELECT flows.flow_name, latest_state.update_state, bounds.update_started_at,
                    current_timestamp())
        END AS seconds_since_batch_or_start
 FROM flows CROSS JOIN bounds LEFT JOIN latest_state ON true
+LEFT JOIN backlog ON backlog.flow_name = flows.flow_name
 ORDER BY flows.flow_name;
 ```
 
